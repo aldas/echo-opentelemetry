@@ -4,7 +4,6 @@
 package echootel
 
 import (
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,10 +11,11 @@ import (
 
 	"github.com/labstack/echo/v5"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/semconv/v1.39.0/httpconv"
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
 
@@ -125,22 +125,35 @@ func TestSkipper(t *testing.T) {
 
 func TestMetrics(t *testing.T) {
 	tests := []struct {
-		name          string
-		givenConfig   Config
-		requestTarget string
-		wantRouteAttr string
-		wantStatus    int64
+		name              string
+		givenConfig       Config
+		whenRequestTarget string
+		expectAttr        []attribute.KeyValue
 	}{
 		{
-			name:          "default",
-			requestTarget: "/user/123",
-			wantRouteAttr: "/user/:id",
-			wantStatus:    200,
+			name:              "default",
+			whenRequestTarget: "/user/123",
+			expectAttr: []attribute.KeyValue{
+				attribute.String("http.request.method", "GET"),
+				attribute.Int64("http.response.status_code", 200),
+				attribute.String("network.protocol.name", "http"),
+				attribute.String("network.protocol.version", "1.1"),
+				attribute.String("server.address", "foobar"),
+				attribute.String("url.scheme", "http"),
+				attribute.String("http.route", "/user/:id"),
+			},
 		},
 		{
-			name:          "request target not exist",
-			requestTarget: "/abc/123",
-			wantStatus:    404,
+			name:              "request target not exist",
+			whenRequestTarget: "/abc/123",
+			expectAttr: []attribute.KeyValue{
+				attribute.String("http.request.method", "GET"),
+				attribute.Int64("http.response.status_code", 404),
+				attribute.String("network.protocol.name", "http"),
+				attribute.String("network.protocol.version", "1.1"),
+				attribute.String("server.address", "foobar"),
+				attribute.String("url.scheme", "http"),
+			},
 		},
 		{
 			name: "with metric attributes callback",
@@ -148,26 +161,36 @@ func TestMetrics(t *testing.T) {
 				SpanStartAttributes: func(c *echo.Context, v *Values, attr []attribute.KeyValue) []attribute.KeyValue {
 					return append(attr, attribute.String("key3", "value3")) // these are not used
 				},
-				MetricAttributes: func(c *echo.Context, v *Values, attr []attribute.KeyValue) []attribute.KeyValue {
-					return append(attr,
+				MetricAttributes: func(c *echo.Context, v *Values) []attribute.KeyValue {
+					return append(v.MetricAttributes(),
 						attribute.String("key1", "value1"),
 						attribute.String("key2", "value"),
 						attribute.String("method", strings.ToUpper(c.Request().Method)),
 					)
 				},
 			},
-			requestTarget: "/user/123",
-			wantRouteAttr: "/user/:id",
-			wantStatus:    200,
+			whenRequestTarget: "/user/123",
+			expectAttr: []attribute.KeyValue{
+				attribute.String("http.request.method", "GET"),
+				attribute.Int64("http.response.status_code", 200),
+				attribute.String("network.protocol.name", "http"),
+				attribute.String("network.protocol.version", "1.1"),
+				attribute.String("server.address", "foobar"),
+				attribute.String("url.scheme", "http"),
+				attribute.String("http.route", "/user/:id"),
+				attribute.String("key1", "value1"),
+				attribute.String("key2", "value"),
+				attribute.String("method", "GET"),
+			},
 		},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
 			reader := sdkmetric.NewManualReader()
 			meterProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 
-			config := tt.givenConfig
+			config := tc.givenConfig
 			if config.ServerName == "" {
 				config.ServerName = "foobar"
 			}
@@ -183,36 +206,18 @@ func TestMetrics(t *testing.T) {
 				return c.String(http.StatusOK, id)
 			})
 
-			r := httptest.NewRequest(http.MethodGet, tt.requestTarget, http.NoBody)
+			r := httptest.NewRequest(http.MethodGet, tc.whenRequestTarget, http.NoBody)
 			w := httptest.NewRecorder()
 			e.ServeHTTP(w, r)
 
 			// verify metrics
 			rm := metricdata.ResourceMetrics{}
-			require.NoError(t, reader.Collect(t.Context(), &rm))
+			assert.NoError(t, reader.Collect(t.Context(), &rm))
 
-			require.Len(t, rm.ScopeMetrics, 1)
+			assert.Len(t, rm.ScopeMetrics, 1)
 			sm := rm.ScopeMetrics[0]
 			assert.Equal(t, ScopeName, sm.Scope.Name)
 			assert.Equal(t, Version, sm.Scope.Version)
-
-			attrs := []attribute.KeyValue{
-				attribute.String("http.request.method", "GET"),
-				attribute.Int64("http.response.status_code", tt.wantStatus),
-				attribute.String("network.protocol.name", "http"),
-				attribute.String("network.protocol.version", fmt.Sprintf("1.%d", r.ProtoMinor)),
-				attribute.String("server.address", "foobar"),
-				attribute.String("url.scheme", "http"),
-			}
-			if tt.wantRouteAttr != "" {
-				attrs = append(attrs, attribute.String("http.route", tt.wantRouteAttr))
-			}
-
-			c := e.NewContext(r, w)
-
-			if tt.givenConfig.MetricAttributes != nil {
-				attrs = tt.givenConfig.MetricAttributes(c, &Values{}, attrs)
-			}
 
 			metricdatatest.AssertEqual(t, metricdata.Metrics{
 				Name:        "http.server.request.duration",
@@ -222,7 +227,7 @@ func TestMetrics(t *testing.T) {
 					Temporality: metricdata.CumulativeTemporality,
 					DataPoints: []metricdata.HistogramDataPoint[float64]{
 						{
-							Attributes: attribute.NewSet(attrs...),
+							Attributes: attribute.NewSet(tc.expectAttr...),
 						},
 					},
 				},
@@ -236,7 +241,7 @@ func TestMetrics(t *testing.T) {
 					Temporality: metricdata.CumulativeTemporality,
 					DataPoints: []metricdata.HistogramDataPoint[int64]{
 						{
-							Attributes: attribute.NewSet(attrs...),
+							Attributes: attribute.NewSet(tc.expectAttr...),
 						},
 					},
 				},
@@ -250,7 +255,7 @@ func TestMetrics(t *testing.T) {
 					Temporality: metricdata.CumulativeTemporality,
 					DataPoints: []metricdata.HistogramDataPoint[int64]{
 						{
-							Attributes: attribute.NewSet(attrs...),
+							Attributes: attribute.NewSet(tc.expectAttr...),
 						},
 					},
 				},
@@ -267,12 +272,11 @@ func TestWithMetricAttributeFn(t *testing.T) {
 	e.Use(NewMiddlewareWithConfig(Config{
 		ServerName:    "test-service",
 		MeterProvider: meterProvider,
-		MetricAttributes: func(c *echo.Context, v *Values, attr []attribute.KeyValue) []attribute.KeyValue {
-			attr = append(
-				attr,
+		MetricAttributes: func(c *echo.Context, v *Values) []attribute.KeyValue {
+			return append(
+				v.MetricAttributes(),
 				attribute.String("custom.header", c.Request().Header.Get("X-Test-Header")),
 			)
-			return attr
 		},
 	}))
 
@@ -289,17 +293,17 @@ func TestWithMetricAttributeFn(t *testing.T) {
 
 	// verify metrics
 	rm := metricdata.ResourceMetrics{}
-	require.NoError(t, reader.Collect(t.Context(), &rm))
-	require.Len(t, rm.ScopeMetrics, 1)
+	assert.NoError(t, reader.Collect(t.Context(), &rm))
+	assert.Len(t, rm.ScopeMetrics, 1)
 	sm := rm.ScopeMetrics[0]
-	require.Len(t, sm.Metrics, 3)
+	assert.Len(t, sm.Metrics, 3)
 
 	// Check that custom attribute is present
 	found := false
 	for _, metric := range sm.Metrics {
 		if metric.Name == "http.server.request.duration" {
 			histogram := metric.Data.(metricdata.Histogram[float64])
-			require.Len(t, histogram.DataPoints, 1)
+			assert.Len(t, histogram.DataPoints, 1)
 			attrs := histogram.DataPoints[0].Attributes.ToSlice()
 			for _, attr := range attrs {
 				if attr.Key == "custom.header" && attr.Value.AsString() == "test-value" {
@@ -320,14 +324,13 @@ func TestWithEchoMetricAttributeFn(t *testing.T) {
 	e.Use(NewMiddlewareWithConfig(Config{
 		ServerName:    "test-service",
 		MeterProvider: meterProvider,
-		MetricAttributes: func(c *echo.Context, v *Values, attr []attribute.KeyValue) []attribute.KeyValue {
-			attr = append(
-				attr,
+		MetricAttributes: func(c *echo.Context, v *Values) []attribute.KeyValue {
+			return append(
+				v.MetricAttributes(),
 				// This is just for testing. Avoid high cardinality metrics such as "id" in production code
 				attribute.String("echo.param.id", c.Param("id")),
 				attribute.String("echo.path", c.Path()),
 			)
-			return attr
 		},
 	}))
 
@@ -343,10 +346,10 @@ func TestWithEchoMetricAttributeFn(t *testing.T) {
 
 	// verify metrics
 	rm := metricdata.ResourceMetrics{}
-	require.NoError(t, reader.Collect(t.Context(), &rm))
-	require.Len(t, rm.ScopeMetrics, 1)
+	assert.NoError(t, reader.Collect(t.Context(), &rm))
+	assert.Len(t, rm.ScopeMetrics, 1)
 	sm := rm.ScopeMetrics[0]
-	require.Len(t, sm.Metrics, 3)
+	assert.Len(t, sm.Metrics, 3)
 
 	// Check that custom attributes are present
 	foundID := false
@@ -354,7 +357,7 @@ func TestWithEchoMetricAttributeFn(t *testing.T) {
 	for _, metric := range sm.Metrics {
 		if metric.Name == "http.server.request.duration" {
 			histogram := metric.Data.(metricdata.Histogram[float64])
-			require.Len(t, histogram.DataPoints, 1)
+			assert.Len(t, histogram.DataPoints, 1)
 			attrs := histogram.DataPoints[0].Attributes.ToSlice()
 			for _, attr := range attrs {
 				if attr.Key == "echo.param.id" && attr.Value.AsString() == "456" {
@@ -368,6 +371,79 @@ func TestWithEchoMetricAttributeFn(t *testing.T) {
 	}
 	assert.True(t, foundID, "echo param id attribute should be found")
 	assert.True(t, foundPath, "echo path attribute should be found")
+}
+
+type customMetrics struct {
+	requestDurationHistogram httpconv.ServerRequestDuration
+}
+
+func newCustomMetrics(meter metric.Meter) *customMetrics {
+	reqDuration, _ := httpconv.NewServerRequestDuration(
+		meter,
+		metric.WithExplicitBucketBoundaries(0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1, 2.5, 5, 7.5, 10),
+	)
+	return &customMetrics{
+		requestDurationHistogram: reqDuration,
+	}
+}
+
+func (m *customMetrics) Record(c *echo.Context, v RecordValues) {
+	o := metric.WithAttributeSet(attribute.NewSet(v.ExtractedValues.MetricAttributes()...))
+	m.requestDurationHistogram.Inst().Record(c.Request().Context(), v.RequestDuration.Seconds(), o)
+}
+
+func TestNewMiddlewareWithConfig_Metric(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	meterProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+
+	config := Config{
+		ServerName: "foobar",
+		Metrics:    newCustomMetrics(meterProvider.Meter(ScopeName, metric.WithInstrumentationVersion(Version))),
+	}
+
+	e := echo.New()
+	e.Use(NewMiddlewareWithConfig(config))
+	e.GET("/user/:id", func(c *echo.Context) error {
+		id := c.Param("id")
+		assert.Equal(t, "123", id)
+		return c.String(http.StatusOK, id)
+	})
+
+	r := httptest.NewRequest(http.MethodGet, "/user/123", http.NoBody)
+	w := httptest.NewRecorder()
+	e.ServeHTTP(w, r)
+
+	// verify metrics
+	rm := metricdata.ResourceMetrics{}
+	assert.NoError(t, reader.Collect(t.Context(), &rm))
+
+	assert.Len(t, rm.ScopeMetrics, 1)
+	sm := rm.ScopeMetrics[0]
+	assert.Len(t, sm.Metrics, 1)
+	assert.Equal(t, ScopeName, sm.Scope.Name)
+	assert.Equal(t, Version, sm.Scope.Version)
+
+	metricdatatest.AssertEqual(t, metricdata.Metrics{
+		Name:        "http.server.request.duration",
+		Description: "Duration of HTTP server requests.",
+		Unit:        "s",
+		Data: metricdata.Histogram[float64]{
+			Temporality: metricdata.CumulativeTemporality,
+			DataPoints: []metricdata.HistogramDataPoint[float64]{
+				{
+					Attributes: attribute.NewSet([]attribute.KeyValue{
+						attribute.String("http.request.method", "GET"),
+						attribute.Int64("http.response.status_code", 200),
+						attribute.String("network.protocol.name", "http"),
+						attribute.String("network.protocol.version", "1.1"),
+						attribute.String("server.address", "foobar"),
+						attribute.String("url.scheme", "http"),
+						attribute.String("http.route", "/user/:id"),
+					}...),
+				},
+			},
+		},
+	}, sm.Metrics[0], metricdatatest.IgnoreTimestamp(), metricdatatest.IgnoreValue(), metricdatatest.IgnoreExemplars())
 }
 
 func TestWithOnError(t *testing.T) {

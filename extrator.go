@@ -64,28 +64,30 @@ func NewMetrics(meter metric.Meter) (*Metrics, error) {
 	}, nil
 }
 
-// IncrementValues represents the values to be used for Increment method.
-type IncrementValues struct {
+// RecordValues represents the values to Record metrics.
+type RecordValues struct {
 	// RequestDuration is the duration of request processing. Will be used with `http.server.request.duration` metric.
 	RequestDuration time.Duration
 
-	// RequestSize is the size of the request body in bytes. Will be used with `http.server.request.body.size` metric.
-	RequestSize int64
+	// ExtractedValues are values extracted from HTTP request and response before and after processing the next middleware/handler.
+	ExtractedValues Values
 
-	// ResponseSize is the size of the response body in bytes. Will be used with `http.server.response.body.size` metric.
-	ResponseSize int64
-
-	// Attributes are additional attributes to be used for incremented metrics.
+	// Attributes are attributes to be used for recording metrics.
+	// If left empty, the Metrics.Record method will use default attributes by calling Values.MetricAttributes().
 	Attributes []attribute.KeyValue
 }
 
-// Increment records the given IncrementValues to the Metrics instance.
-func (m *Metrics) Increment(ctx context.Context, v IncrementValues) {
-	o := metric.WithAttributeSet(attribute.NewSet(v.Attributes...))
+// Record records the given RecordValues to the Metrics instance.
+func (m *Metrics) Record(ctx context.Context, v RecordValues) {
+	attrs := v.Attributes
+	if len(attrs) == 0 {
+		attrs = v.ExtractedValues.MetricAttributes()
+	}
+	o := metric.WithAttributeSet(attribute.NewSet(attrs...))
 
 	m.requestDurationHistogram.Inst().Record(ctx, v.RequestDuration.Seconds(), o)
-	m.requestBodySizeHistogram.Inst().Record(ctx, v.RequestSize, o)
-	m.responseBodySizeHistogram.Inst().Record(ctx, v.ResponseSize, o)
+	m.requestBodySizeHistogram.Inst().Record(ctx, v.ExtractedValues.HTTPRequestBodySize, o)
+	m.responseBodySizeHistogram.Inst().Record(ctx, v.ExtractedValues.HTTPResponseBodySize, o)
 }
 
 // Values represent extracted values from HTTP request and response to be used for Span and Metrics attributes.
@@ -248,6 +250,18 @@ type Values struct {
 	//  * metric - Conditionally Required If and only if it's available
 	HTTPRoute string // metric, span
 
+	// HTTPRequestBodySize (`http.request.body.size`) is the size of the request payload body in bytes. This is the number
+	// of bytes transferred excluding headers and is often, but not always, present as the [Content-Length](https://www.rfc-editor.org/rfc/rfc9110.html#field.content-length)
+	// header. For requests using transport encoding, this should be the compressed size.
+	// Spec: https://opentelemetry.io/docs/specs/semconv/http/http-metrics/#metric-httpclientrequestbodysize
+	//
+	// Go: This value is taken from `Request.ContentLength` can be negative (-1) if the size is unknown.
+	//
+	// Requirement Level:
+	//  * span - opt-in attribute
+	//  * metric - optional, is actual Histogram metric (`http.client.request.body.size`) and NOT attribute to metric.
+	HTTPRequestBodySize int64 // metric
+
 	// HTTPResponseStatusCode (`http.response.status_code`) is HTTP response status code.
 	// See also RFC: https://datatracker.ietf.org/doc/html/rfc7231#section-6
 	// Spec: https://opentelemetry.io/docs/specs/semconv/registry/attributes/http/
@@ -267,18 +281,6 @@ type Values struct {
 	//  * span - opt-in attribute
 	//  * metric - optional, is actual Histogram metric (`http.server.response.body.size`) and NOT attribute to metric.
 	HTTPResponseBodySize int64 // metric
-
-	// HTTPRequestBodySize (`http.request.body.size`) is the size of the request payload body in bytes. This is the number
-	// of bytes transferred excluding headers and is often, but not always, present as the [Content-Length](https://www.rfc-editor.org/rfc/rfc9110.html#field.content-length)
-	// header. For requests using transport encoding, this should be the compressed size.
-	// Spec: https://opentelemetry.io/docs/specs/semconv/http/http-metrics/#metric-httpclientrequestbodysize
-	//
-	// Go: This value is taken from `Request.ContentLength` can be negative (-1) if the size is unknown.
-	//
-	// Requirement Level:
-	//  * span - opt-in attribute
-	//  * metric - optional, is actual Histogram metric (`http.client.request.body.size`) and NOT attribute to metric.
-	HTTPRequestBodySize int64 // metric
 }
 
 // ExtractRequest extracts values from the given HTTP request and populates the Values struct.
